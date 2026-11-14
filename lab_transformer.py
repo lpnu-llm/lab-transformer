@@ -33,6 +33,9 @@
 # %%
 import json
 import math
+import platform
+from statistics import median
+from time import perf_counter
 import os
 from pathlib import Path
 
@@ -331,11 +334,232 @@ def compare_pretrained(config, weights, tokenizer):
         assert torch.equal(ours, theirs), (ours, theirs)
         print(f"✓ max |Δlogits|={error:.2e}; {tokenizer.decode(ours[0], skip_special_tokens=True)}")
 
+    return reference
+
 if __name__ == "__main__":
-    compare_pretrained(config, weights, tokenizer)
+    reference = compare_pretrained(config, weights, tokenizer)
 
 # %% [markdown]
-# ## 11. Дослідження та звіт
+# ## 11. Порівняння швидкості inference
+#
+# Порівняємо повну генерацію одного перекладу: encoder і всі кроки decoder.
+# Власна реалізація працює без KV-cache. Для Transformers виміряємо два режими:
+# `use_cache=False` для однакового обсягу повторних обчислень та `use_cache=True`,
+# щоб оцінити ефект кешування. Обидва використовують greedy decoding.
+#
+# Працюємо на CPU, float32, batch=1, з однаковою кількістю потоків і лімітом
+# токенів. Токенізація, завантаження ваг, перевірки та декодування тексту
+# не входять у час. Кожен виклик починається з нового encoder проходу й
+# порожнього decoder-кешу. Спочатку прогріваємо кожен режим, далі чергуємо
+# порядок вимірювань, щоб зменшити вплив порядку запусків.
+#
+# Звітуємо медіану часу, діапазон, кількість нових токенів (разом із EOS,
+# без стартового токена) та tokens/s = кількість / медіана часу.
+# Це пропускна здатність усієї генерації, а не швидкість одного decoder-кроку.
+# EOS може завершити генерацію раніше ліміту; перевіряємо однакові id усіх режимів.
+# Відношення `час власної / час Transformers` понад 1 означає, що Transformers
+# швидший. Конкретні числа залежать від CPU, довжин і версій бібліотек;
+# на коротких текстах накладні витрати можуть переважати виграш від KV-cache.
+
+# %%
+@torch.inference_mode()
+def benchmark_inference(config, weights, tokenizer, reference, repeats=5, warmup=2,
+                        max_new_tokens=32,
+                        prompt="translate English to German: The house is wonderful."):
+    if repeats < 1 or warmup < 1 or max_new_tokens < 1:
+        raise ValueError("repeats, warmup та max_new_tokens мають бути додатними")
+    reference.eval()
+    assert next(reference.parameters()).device.type == "cpu"
+    assert next(reference.parameters()).dtype == torch.float32
+    assert weights["shared.weight"].device.type == "cpu"
+    assert weights["shared.weight"].dtype == torch.float32
+    inputs = tokenizer(prompt, return_tensors="pt")
+    runs = {
+        "Власна, без cache": lambda: greedy_generate(
+            inputs.input_ids, inputs.attention_mask, weights, config, max_new_tokens),
+        "Transformers, без cache": lambda: reference.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=False),
+        "Transformers, KV-cache": lambda: reference.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=True),
+    }
+    expected = None
+    for run in runs.values():
+        for _ in range(warmup):
+            output = run()
+            if expected is None:
+                expected = output.clone()
+            assert torch.equal(output, expected), "Різні id: спочатку перевірте правильність inference"
+    times = {name: [] for name in runs}
+    names = list(runs)
+    for repeat in range(repeats):
+        order = names[repeat % len(names):] + names[:repeat % len(names)]
+        for name in order:
+            start = perf_counter()
+            output = runs[name]()
+            elapsed = perf_counter() - start
+            assert torch.equal(output, expected)
+            times[name].append(elapsed)
+    count = expected.shape[1] - 1
+    import transformers
+    print(f"CPU: {platform.machine()}; torch={torch.__version__}; transformers={transformers.__version__}")
+    print(f"Потоків: {torch.get_num_threads()}; source tokens={inputs.input_ids.shape[1]}; "
+          f"нових токенів={count}; warmup={warmup}; repeats={repeats}")
+    print(f"{'Режим':<28} {'Медіана, ms':>12} {'min–max, ms':>20} {'tokens/s':>10} {'Відношення':>12}")
+    baseline = median(times[names[0]])
+    rows = []
+    for name, samples in times.items():
+        seconds = median(samples)
+        ratio = baseline / seconds
+        rows.append(dict(mode=name, median_seconds=seconds, min_seconds=min(samples),
+                         max_seconds=max(samples), new_tokens=count,
+                         tokens_per_second=count / seconds, relative_speed=ratio))
+        span = f"{min(samples)*1000:.1f}–{max(samples)*1000:.1f}"
+        print(f"{name:<28} {seconds*1000:>12.1f} {span:>20} {count/seconds:>10.1f} {ratio:>11.2f}x")
+    return rows
+
+if __name__ == "__main__":
+    timing_results = benchmark_inference(config, weights, tokenizer, reference)
+
+# %% [markdown]
+# **Дослідження:** повторіть вимірювання для довшого source-тексту і лімітів
+# 16, 32 та 64. Запишіть фактичну довжину виходу: якщо EOS з'являється раніше,
+# збільшення ліміту не збільшує обсяг роботи. Для дослідження довгих виходів
+# використайте довший текст із завданням `summarize:`. Поясніть вплив KV-cache
+# і причини, чому однакова математика не гарантує однаковий час виконання.
+
+# %% [markdown]
+# ## 12. Необов'язково: збираємо Mixture-of-Experts
+#
+# Усі компоненти експерта вже знайомі: це та сама `ffn(z, wi, wo)`.
+# Новий навчуваний компонент — **router / gating network**: один Linear
+# без bias із `D` входами та `E` виходами, по одному score на експерта.
+# Softmax перетворює scores на ймовірності. Router працює **окремо для кожного
+# токена**, використовуючи його поточний прихований стан, а не id слова.
+#
+# Це не останній шар моделі перед словником. MoE замінює FFN-гілку обраного
+# Transformer-блока. Attention, RMSNorm, residual і LM head уже реалізовані.
+# Для першого експерименту замініть лише FFN останнього encoder-блока:
+#
+# ![MoE: router обирає два FFN-експерти та змішує їхні виходи](figures/moe.svg)
+#
+# Приклад на рисунку: softmax дає `[0.50, 0.20, 0.30]`; top-2 обирає
+# експерти 1 і 3. Після нормування: `0.50/0.80=0.625`, `0.30/0.80=0.375`.
+#
+# Для `z=(B,L,D)`: `scores=linear(z, router_weight)` має форму `(B,L,E)`.
+# Оберіть `k` найбільших імовірностей; перенормуйте **тільки обрані** ваги
+# так, щоб їхня сума дорівнювала 1. Потім обчисліть
+# `y = sum(gate_j * expert_j(z))` для обраних експертів.
+# Тут `E=3`, за замовчуванням `k=2`; можливий також `k=1`.
+# Це навчальний варіант top-k routing, не точна реалізація Switch Transformer:
+# у Switch top-1 вихід масштабується початковою ймовірністю router.
+# У нашому нормованому top-1 вага завжди 1; для навчання router через task loss
+# цього недостатньо. Навчання, capacity limits і балансувальні loss тут не додаємо.
+# [Джерело: Switch Transformers](https://jmlr.org/papers/v23/21-0998.html).
+#
+# **Вправа.** Реалізуйте `moe_ffn`, повторно використовуючи `linear` та `ffn`.
+# `experts` — список пар `(wi, wo)`, кожна пара має власні ваги.
+# Поверніть `(y, indices, gates)` форм `(B,L,D)`, `(B,L,k)`, `(B,L,k)`.
+# Зведіть токени до `(B*L,D)`, для кожного експерта виберіть лише призначені
+# йому токени, викличте FFN для цієї підмножини та додайте зважені виходи
+# на початкові позиції. Не обчислюйте всі експерти для всіх токенів:
+# це перевірить формулу, але не реалізує sparse execution.
+# При `k < 1` або `k > E` підніміть `ValueError`. Невибраний експерт не викликайте.
+
+# %%
+def moe_ffn(z, router_weight, experts, top_k=2):
+    """Sparse top-k FFN; ваги gates нормовані серед обраних експертів."""
+    ...
+
+
+def moe_residual(x, gamma, eps, router_weight, experts, top_k=2):
+    z = rms_norm(x, gamma, eps)
+    branch, indices, gates = moe_ffn(z, router_weight, experts, top_k)
+    return residual_add(x, branch), indices, gates
+
+
+@torch.inference_mode()
+def test_moe():
+    z = torch.tensor([[[2., 1.], [1., 3.]], [[4., 1.], [1., 2.]]])
+    eye = torch.eye(2)
+    experts = [(eye, eye), (eye, 2 * eye), (eye, 3 * eye)]
+    router = torch.tensor([[2., 0.], [0., 2.], [-1., -1.]])
+    for k in (1, 2, 3):
+        actual, indices, gates = moe_ffn(z, router, experts, k)
+        torch.testing.assert_close(gates.sum(-1), torch.ones_like(z[..., 0]))
+        assert indices.shape == gates.shape == (*z.shape[:-1], k)
+        # Незалежна dense-формула лише для перевірки sparse-реалізації.
+        probabilities = torch.softmax(z @ router.T, -1)
+        chosen, expected_indices = probabilities.topk(k, -1)
+        chosen = chosen / chosen.sum(-1, keepdim=True)
+        assert torch.equal(indices, expected_indices)
+        torch.testing.assert_close(gates, chosen)
+        expected = torch.zeros_like(z)
+        for expert_id, (wi, wo) in enumerate(experts):
+            mass = ((indices == expert_id) * gates).sum(-1, keepdim=True)
+            expected += mass * ffn(z, wi, wo)
+        torch.testing.assert_close(actual, expected)
+    # Третій експерт ніколи не обирається при k=2; його NaN не мають потрапити у вихід.
+    unused = experts[:2] + [(eye, torch.full_like(eye, float("nan")))]
+    assert torch.isfinite(moe_ffn(z, router, unused, 2)[0]).all()
+    identical = [experts[0]] * 3
+    torch.testing.assert_close(moe_ffn(z, router, identical, 2)[0], ffn(z, eye, eye))
+    output, _, _ = moe_residual(z, torch.ones(2), 1e-6, router, identical)
+    torch.testing.assert_close(output, z + ffn(rms_norm(z, torch.ones(2), 1e-6), eye, eye))
+    for k in (0, 4):
+        try:
+            moe_ffn(z, router, experts, k)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Перевірте межі top_k")
+    print("✓ optional MoE: routing, weighted sum, unused expert, residual")
+
+# Цей розділ можна пропустити, не заповнюючи moe_ffn.
+RUN_OPTIONAL_MOE = False
+if __name__ == "__main__" and RUN_OPTIONAL_MOE:
+    test_moe()
+
+# %% [markdown]
+# ### Підключаємо до зібраного T5
+#
+# Зробіть окрему копію `transformer_stack` під назвою `moe_transformer_stack`.
+# Залиште основну T5-реалізацію для порівнянь. Після attention останнього
+# encoder-блока замість його RMSNorm + FFN + residual викличте `moe_residual`.
+# Передайте gamma з `encoder.block.5.layer.1.layer_norm.weight` та три
+# **окремі клони** його `DenseReluDense.wi.weight` і `wo.weight`.
+# Router ініціалізуйте `torch.randn(3, config.d_model) * 0.01` із фіксованим seed.
+# Інші блоки та фінальну RMSNorm виконайте без змін. Потрібні нові аргументи
+# `router_weight` і `experts` для копії стеку. Підключення всередині циклу:
+#
+# ```python
+# if not decoder and i == config.num_layers - 1:
+#     x, routes, gates = moe_residual(
+#         x, weights[ff + "layer_norm.weight"], config.layer_norm_epsilon,
+#         router_weight, experts, top_k=2)
+# else:
+#     # Попередня RMSNorm → FFN → residual гілка.
+#     ...
+# ```
+#
+# 1. З однаковими експертами порівняйте стани encoder із початковим T5:
+#    вони мають збігатися в межах float32 похибки для будь-якого routing,
+#    бо сума gates дорівнює 1. Це перевірка правильності підключення.
+# 2. Лише для експерименту змініть `wo` другого експерта, наприклад помножте
+#    на 1.1. Перевірте, що стани змінюються для токенів, які його обирають.
+#    Такі вручну змінені ваги не є навченими MoE-експертами; поліпшення
+#    перекладу не очікуємо. T5-small checkpoint не містить MoE router чи експертів.
+# 3. Порахуйте `torch.bincount(routes.reshape(-1), minlength=3)` для справжніх
+#    токенів джерела, виключивши padding. Чи всі експерти отримують токени?
+# 4. Порівняйте кількість параметрів: dense FFN має `2*D*d_ff`, MoE має
+#    `E*2*D*d_ff + E*D`; на токен виконується `k` FFN і router.
+#    Більша загальна кількість параметрів не означає менший час. Наші Python
+#    dispatch-цикли можуть бути повільними; прискорення тут не обіцяємо.
+#
+# Для необов'язкового звіту достатньо реалізації, локальних перевірок,
+# порівняння encoder-станів і гістограми призначень. Навчати MoE не потрібно.
+
+# %% [markdown]
+# ## 13. Дослідження та звіт
 #
 # 1. Намалюйте шлях source → encoder → cross-attention → decoder → vocabulary.
 #    Позначте форми для source довжини 7 і target довжини 4.
@@ -348,7 +572,7 @@ if __name__ == "__main__":
 # 7. Де саме обчислення повторюються без KV-cache? Що можна було б кешувати?
 #
 # Здайте notebook із заповненими функціями, виконаними перевірками,
-# результатами перекладу та короткими відповідями. Очікуваний результат —
+# результатами перекладу, таблицею часу для трьох режимів та короткими відповідями. Очікуваний результат —
 # усі локальні перевірки проходять, pretrained logits близькі до еталона,
 # greedy id збігаються для наведених прикладів.
 #
