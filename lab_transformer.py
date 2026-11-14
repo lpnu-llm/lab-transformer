@@ -428,136 +428,299 @@ if __name__ == "__main__":
 # і причини, чому однакова математика не гарантує однаковий час виконання.
 
 # %% [markdown]
-# ## 12. Необов'язково: збираємо Mixture-of-Experts
+# ## 12. Необов'язково: pretrained Mixture-of-Experts — Switch-base-8
 #
-# Усі компоненти експерта вже знайомі: це та сама `ffn(z, wi, wo)`.
-# Новий навчуваний компонент — **router / gating network**: один Linear
-# без bias із `D` входами та `E` виходами, по одному score на експерта.
-# Softmax перетворює scores на ймовірності. Router працює **окремо для кожного
-# токена**, використовуючи його поточний прихований стан, а не id слова.
+# T5-small не містить MoE. Тепер завантажимо **іншу навчену модель**:
+# `google/switch-base-8`. Це encoder–decoder з T5-подібними attention,
+# RMSNorm, relative position bias і FFN-експертами. Можна повторно використати
+# вже реалізовані функції; новий компонент — router перед експертами.
+# У кожному стеку 12 блоків, кожен другий має sparse FFN із 8 експертів.
+# Router обирає **одного експерта для кожного токена**, а не для всього речення.
 #
-# Це не останній шар моделі перед словником. MoE замінює FFN-гілку обраного
-# Transformer-блока. Attention, RMSNorm, residual і LM head уже реалізовані.
-# Для першого експерименту замініть лише FFN останнього encoder-блока:
+# Ваги safetensors: приблизно **1.24 GB у bfloat16**, близько 619 млн параметрів.
+# Для цієї CPU-вправи переводимо їх у float32: близько 2.48 GB на одну копію.
+# Порівняння з еталоном потребує двох копій плюс проміжна пам'ять.
+# Файл завантажується лише при запуску необов'язкової частини й кешується.
 #
-# ![MoE: router обирає два FFN-експерти та змішує їхні виходи](figures/moe.svg)
+# Це pretrained **span-corruption** модель: вона відновлює пропущені фрагменти
+# англійського тексту, позначені `<extra_id_0>`. Вона не instruction/chat модель
+# і не готовий перекладач. Приклад: `The capital of France is <extra_id_0>.`
+# Decoder повертає sentinel-маркери та заповнення; покажемо також відновлений текст.
+# [Model card](https://huggingface.co/google/switch-base-8).
 #
-# Приклад на рисунку: softmax дає `[0.50, 0.20, 0.30]`; top-2 обирає
-# експерти 1 і 3. Після нормування: `0.50/0.80=0.625`, `0.30/0.80=0.375`.
+# ![Рисунок 2 зі статті Switch Transformers: encoder-блок і маршрутизація токенів](figures/switch_transformer_paper.svg)
 #
-# Для `z=(B,L,D)`: `scores=linear(z, router_weight)` має форму `(B,L,E)`.
-# Оберіть `k` найбільших імовірностей; перенормуйте **тільки обрані** ваги
-# так, щоб їхня сума дорівнювала 1. Потім обчисліть
-# `y = sum(gate_j * expert_j(z))` для обраних експертів.
-# Тут `E=3`, за замовчуванням `k=2`; можливий також `k=1`.
-# Це навчальний варіант top-k routing, не точна реалізація Switch Transformer:
-# у Switch top-1 вихід масштабується початковою ймовірністю router.
-# У нашому нормованому top-1 вага завжди 1; для навчання router через task loss
-# цього недостатньо. Навчання, capacity limits і балансувальні loss тут не додаємо.
-# [Джерело: Switch Transformers](https://jmlr.org/papers/v23/21-0998.html).
+# **Оригінальний рисунок 2:** William Fedus, Barret Zoph, Noam Shazeer,
+# *Switch Transformers: Scaling to Trillion Parameter Models with Simple and
+# Efficient Sparsity*, JMLR 23(120), 2022.
+# [Стаття та підпис рисунка](https://arxiv.org/html/2101.03961v3#S2.F2).
+# Локальна копія оригінального SVG, без перемальовування.
 #
-# **Вправа.** Реалізуйте `moe_ffn`, повторно використовуючи `linear` та `ffn`.
-# `experts` — список пар `(wi, wo)`, кожна пара має власні ваги.
-# Поверніть `(y, indices, gates)` форм `(B,L,D)`, `(B,L,k)`, `(B,L,k)`.
-# Зведіть токени до `(B*L,D)`, для кожного експерта виберіть лише призначені
-# йому токени, викличте FFN для цієї підмножини та додайте зважені виходи
-# на початкові позиції. Не обчислюйте всі експерти для всіх токенів:
-# це перевірить формулу, але не реалізує sparse execution.
-# При `k < 1` або `k > E` підніміть `ValueError`. Невибраний експерт не викликайте.
+# На рисунку та у вправі однаковий **Switch top-1**: вихід обраного експерта
+# множимо на його початкову softmax-ймовірність. **Не** перенормовуємо її до 1.
+# Attention, RMSNorm, residual та проєкція у словник вже знайомі.
+# Новий навчуваний шар — `Linear(D, E)` без bias: router.
+#
+# ### 12.1. Router і dispatch — єдина нова вправа
+#
+# `z=(B,L,D)` → `scores=(B,L,E)` → softmax по E → argmax → expert FFN.
+# Повторно використайте `linear` та `ffn`. `experts` — список `(wi, wo)`.
+# Поверніть `(branch, routes, accepted)` форм `(B,L,D)`, `(B,L)`, `(B,L)`.
+# Викликайте лише експертів, які отримали токени, і лише для цих токенів.
+#
+# Checkpoint також задає `expert_capacity=64`: у **кожній послідовності**
+# експерт приймає перші 64 призначені йому токени. Порахуйте порядкові номери
+# через one-hot маршрути та cumsum по L. `accepted` позначає токени в межах
+# capacity. Для точного збігу з Transformers 4.46.3 почніть із `next_states=z.clone()`,
+# замініть прийняті токени виходами їхніх експертів, а потім помножте **всі**
+# `next_states` на максимальну router-ймовірність. Отже, overflow тут повертає
+# `gate*z` усередині гілки; зовнішнє residual-додавання виконується окремо.
+# Це опис поведінки конкретної еталонної реалізації, а не загальне правило MoE.
+# Padding джерела маскуємо в attention, але router цієї версії рахує всі позиції.
+# У коротких прикладах overflow не виникає; tiny-тест нижче перевіряє його окремо.
 
 # %%
-def moe_ffn(z, router_weight, experts, top_k=2):
-    """Sparse top-k FFN; ваги gates нормовані серед обраних експертів."""
+from transformers import SwitchTransformersConfig, SwitchTransformersForConditionalGeneration
+
+SWITCH_MODEL_ID = "google/switch-base-8"
+# Фіксований safetensors-конвертований snapshot офіційного checkpoint (PR #5).
+# Завантажуємо лише config, tokenizer та safetensors; remote code не виконуємо.
+SWITCH_REVISION = "4f9b6f805db423183c0e7c3cda7611e43364acac"
+
+
+def switch_moe(z, router_weight, experts, capacity):
+    """Switch top-1: router → capacity mask → selected FFN → gate * output."""
     ...
 
+# %% [markdown]
+# ### 12.2. Збираємо повну мережу з уже реалізованих компонентів
+#
+# Цикл стеку надано: порівняйте його з вашим `transformer_stack`.
+# В attention нічого не змінюється. Ваги FFN тепер мають префікс `mlp`.
+# Якщо є `mlp.router.classifier.weight`, викликаємо `switch_moe`;
+# інакше використовуємо звичайний dense `ffn`. Router і всі експерти
+# беруть справжні навчені ваги з safetensors, без копіювання FFN T5-small.
+# `routing_log` дозволяє побачити, які експерти працювали.
 
-def moe_residual(x, gamma, eps, router_weight, experts, top_k=2):
-    z = rms_norm(x, gamma, eps)
-    branch, indices, gates = moe_ffn(z, router_weight, experts, top_k)
-    return residual_add(x, branch), indices, gates
+# %%
+def switch_stack(ids, key_mask, weights, config, decoder=False, memory=None,
+                 source_mask=None, routing_log=None):
+    name = "decoder" if decoder else "encoder"
+    x = embedding_lookup(ids, weights["shared.weight"])
+    length = ids.shape[1]
+    mask = attention_mask(key_mask, length, causal=decoder)
+    bias = position_bias(weights[f"{name}.block.0.layer.0.SelfAttention.relative_attention_bias.weight"],
+                         length, length, not decoder, config.relative_attention_max_distance)
+    n_layers = config.num_decoder_layers if decoder else config.num_layers
+    for i in range(n_layers):
+        base = f"{name}.block.{i}.layer."
+        z = rms_norm(x, weights[base + "0.layer_norm.weight"], config.layer_norm_epsilon)
+        x = residual_add(x, multi_head_attention(z, z, weights, base + "0.SelfAttention.",
+                                               config.num_heads, mask, bias))
+        if decoder:
+            z = rms_norm(x, weights[base + "1.layer_norm.weight"], config.layer_norm_epsilon)
+            cross_mask = attention_mask(source_mask, length)
+            x = residual_add(x, multi_head_attention(z, memory, weights, base + "1.EncDecAttention.",
+                                                   config.num_heads, cross_mask))
+        ff = base + ("2." if decoder else "1.")
+        z = rms_norm(x, weights[ff + "layer_norm.weight"], config.layer_norm_epsilon)
+        mlp = ff + "mlp."
+        if mlp + "router.classifier.weight" in weights:
+            experts = [(weights[mlp + f"experts.expert_{j}.wi.weight"],
+                        weights[mlp + f"experts.expert_{j}.wo.weight"])
+                       for j in range(config.num_experts)]
+            branch, routes, accepted = switch_moe(
+                z, weights[mlp + "router.classifier.weight"], experts, config.expert_capacity)
+            if routing_log is not None:
+                routing_log.append((name, i, routes.clone(), accepted.clone()))
+        else:
+            branch = ffn(z, weights[mlp + "wi.weight"], weights[mlp + "wo.weight"])
+        x = residual_add(x, branch)
+    return rms_norm(x, weights[name + ".final_layer_norm.weight"], config.layer_norm_epsilon)
+
+
+def switch_decode_logits(decoder_ids, memory, source_mask, weights, config, routing_log=None):
+    hidden = switch_stack(decoder_ids, torch.ones_like(decoder_ids), weights, config,
+                          decoder=True, memory=memory, source_mask=source_mask,
+                          routing_log=routing_log)
+    if config.tie_word_embeddings:
+        hidden = hidden * config.d_model ** -0.5
+    head = weights.get("lm_head.weight", weights["shared.weight"])
+    return linear(hidden, head)
+
+
+def switch_forward(input_ids, source_mask, decoder_ids, weights, config, routing_log=None):
+    memory = switch_stack(input_ids, source_mask, weights, config, routing_log=routing_log)
+    return switch_decode_logits(decoder_ids, memory, source_mask, weights, config, routing_log)
 
 
 @torch.inference_mode()
-def test_moe():
-    z = torch.tensor([[[2., 1.], [1., 3.]], [[4., 1.], [1., 2.]]])
-    eye = torch.eye(2)
-    experts = [(eye, eye), (eye, 2 * eye), (eye, 3 * eye)]
-    router = torch.tensor([[2., 0.], [0., 2.], [-1., -1.]])
-    for k in (1, 2, 3):
-        actual, indices, gates = moe_ffn(z, router, experts, k)
-        torch.testing.assert_close(gates.sum(-1), torch.ones_like(z[..., 0]))
-        assert indices.shape == gates.shape == (*z.shape[:-1], k)
-        # Незалежна dense-формула лише для перевірки sparse-реалізації.
-        probabilities = torch.softmax(z @ router.T, -1)
-        chosen, expected_indices = probabilities.topk(k, -1)
-        chosen = chosen / chosen.sum(-1, keepdim=True)
-        assert torch.equal(indices, expected_indices)
-        torch.testing.assert_close(gates, chosen)
-        expected = torch.zeros_like(z)
-        for expert_id, (wi, wo) in enumerate(experts):
-            mass = ((indices == expert_id) * gates).sum(-1, keepdim=True)
-            expected += mass * ffn(z, wi, wo)
-        torch.testing.assert_close(actual, expected)
-    # Третій експерт ніколи не обирається при k=2; його NaN не мають потрапити у вихід.
-    unused = experts[:2] + [(eye, torch.full_like(eye, float("nan")))]
-    assert torch.isfinite(moe_ffn(z, router, unused, 2)[0]).all()
-    identical = [experts[0]] * 3
-    torch.testing.assert_close(moe_ffn(z, router, identical, 2)[0], ffn(z, eye, eye))
-    output, _, _ = moe_residual(z, torch.ones(2), 1e-6, router, identical)
-    torch.testing.assert_close(output, z + ffn(rms_norm(z, torch.ones(2), 1e-6), eye, eye))
-    for k in (0, 4):
-        try:
-            moe_ffn(z, router, experts, k)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Перевірте межі top_k")
-    print("✓ optional MoE: routing, weighted sum, unused expert, residual")
-
-# Цей розділ можна пропустити, не заповнюючи moe_ffn.
-RUN_OPTIONAL_MOE = False
-if __name__ == "__main__" and RUN_OPTIONAL_MOE:
-    test_moe()
+def switch_generate(input_ids, source_mask, weights, config, max_new_tokens=24):
+    if input_ids.shape[0] != 1:
+        raise ValueError("Генеруємо по одному тексту")
+    memory = switch_stack(input_ids, source_mask, weights, config)
+    result = torch.full((1, 1), config.decoder_start_token_id, dtype=torch.long)
+    for _ in range(max_new_tokens):
+        logits = switch_decode_logits(result, memory, source_mask, weights, config)
+        next_id = logits[:, -1].argmax(-1, keepdim=True)
+        result = torch.cat([result, next_id], dim=1)
+        if next_id.item() == config.eos_token_id:
+            break
+    return result
 
 # %% [markdown]
-# ### Підключаємо до зібраного T5
+# ### 12.3. Швидка локальна перевірка перед завантаженням
 #
-# Зробіть окрему копію `transformer_stack` під назвою `moe_transformer_stack`.
-# Залиште основну T5-реалізацію для порівнянь. Після attention останнього
-# encoder-блока замість його RMSNorm + FFN + residual викличте `moe_residual`.
-# Передайте gamma з `encoder.block.5.layer.1.layer_norm.weight` та три
-# **окремі клони** його `DenseReluDense.wi.weight` і `wo.weight`.
-# Router ініціалізуйте `torch.randn(3, config.d_model) * 0.01` із фіксованим seed.
-# Інші блоки та фінальну RMSNorm виконайте без змін. Потрібні нові аргументи
-# `router_weight` і `experts` для копії стеку. Підключення всередині циклу:
-#
-# ```python
-# if not decoder and i == config.num_layers - 1:
-#     x, routes, gates = moe_residual(
-#         x, weights[ff + "layer_norm.weight"], config.layer_norm_epsilon,
-#         router_weight, experts, top_k=2)
-# else:
-#     # Попередня RMSNorm → FFN → residual гілка.
-#     ...
-# ```
-#
-# 1. З однаковими експертами порівняйте стани encoder із початковим T5:
-#    вони мають збігатися в межах float32 похибки для будь-якого routing,
-#    бо сума gates дорівнює 1. Це перевірка правильності підключення.
-# 2. Лише для експерименту змініть `wo` другого експерта, наприклад помножте
-#    на 1.1. Перевірте, що стани змінюються для токенів, які його обирають.
-#    Такі вручну змінені ваги не є навченими MoE-експертами; поліпшення
-#    перекладу не очікуємо. T5-small checkpoint не містить MoE router чи експертів.
-# 3. Порахуйте `torch.bincount(routes.reshape(-1), minlength=3)` для справжніх
-#    токенів джерела, виключивши padding. Чи всі експерти отримують токени?
-# 4. Порівняйте кількість параметрів: dense FFN має `2*D*d_ff`, MoE має
-#    `E*2*D*d_ff + E*D`; на токен виконується `k` FFN і router.
-#    Більша загальна кількість параметрів не означає менший час. Наші Python
-#    dispatch-цикли можуть бути повільними; прискорення тут не обіцяємо.
-#
-# Для необов'язкового звіту достатньо реалізації, локальних перевірок,
-# порівняння encoder-станів і гістограми призначень. Навчати MoE не потрібно.
+# На випадковій маленькій моделі перевіряємо обчислення і переповнення capacity.
+# Випадкові ваги тут — лише тест. Для осмисленого тексту далі завантажуємо
+# повний pretrained Switch-base-8 checkpoint.
 
+# %%
+@torch.inference_mode()
+def test_switch_model():
+    torch.manual_seed(17)
+    config = SwitchTransformersConfig(
+        vocab_size=37, d_model=16, d_kv=4, d_ff=32, num_layers=2,
+        num_decoder_layers=2, num_heads=4, num_experts=3,
+        num_sparse_encoder_layers=1, num_sparse_decoder_layers=1,
+        expert_capacity=1, dropout_rate=0., router_jitter_noise=0.,
+        decoder_start_token_id=0, eos_token_id=1, pad_token_id=0)
+    reference = SwitchTransformersForConditionalGeneration(config).eval()
+    # Усі токени обирають expert_0: перевіряємо capacity overflow і невикликані експерти.
+    for name, param in reference.named_parameters():
+        if "router.classifier.weight" in name:
+            param.zero_()
+    weights = reference.state_dict()
+    source = torch.tensor([[4, 5, 1, 0], [8, 9, 10, 1]])
+    mask = source.ne(0).long()
+    target = torch.tensor([[0, 6, 7], [0, 11, 12]])
+    log = []
+    actual = switch_forward(source, mask, target, weights, config, log)
+    expected = reference(input_ids=source, attention_mask=mask,
+                         decoder_input_ids=target, use_cache=False).logits
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    assert len(log) == 2
+    for _, _, routes, accepted in log:
+        assert (routes == 0).all()
+        assert (accepted.sum(-1) == 1).all()
+    # Інший router: більше одного активного експерта, без overflow.
+    config.expert_capacity = 64
+    reference = SwitchTransformersForConditionalGeneration(config).eval()
+    weights = reference.state_dict()
+    actual = switch_forward(source, mask, target, weights, config)
+    expected = reference(input_ids=source, attention_mask=mask,
+                         decoder_input_ids=target, use_cache=False).logits
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    ours = switch_generate(source[:1], mask[:1], weights, config, 4)
+    theirs = reference.generate(input_ids=source[:1], attention_mask=mask[:1],
+                                max_new_tokens=4, do_sample=False, num_beams=1, use_cache=False)
+    assert torch.equal(ours, theirs)
+    print("✓ Switch: dense/sparse blocks, router, capacity, logits and greedy ids")
+
+RUN_OPTIONAL_MOE = False
+if __name__ == "__main__" and RUN_OPTIONAL_MOE:
+    test_switch_model()
+
+# %% [markdown]
+# ### 12.4. Завантажуємо навчені ваги та відновлюємо пропуски
+#
+# Увімкніть `RUN_OPTIONAL_MOE=True` після реалізації `switch_moe` і запустіть
+# комірки нижче. Download (~1.24 GB) та перетворення bf16 → float32 не входять
+# у час inference. Еталон будуємо з тієї ж конфігурації та завантажуємо ті ж
+# тензори. Власний forward не викликає готові Switch-блоки.
+
+# %%
+def load_switch_checkpoint():
+    options = dict(repo_id=SWITCH_MODEL_ID, revision=SWITCH_REVISION, cache_dir=CACHE_DIR)
+    config = SwitchTransformersConfig.from_json_file(hf_hub_download(filename="config.json", **options))
+    assert config.router_bias is False and config.dense_act_fn == "relu"
+    weights = load_file(hf_hub_download(filename="model.safetensors", **options), device="cpu")
+    # Конвертуємо по одному тензору, звільняючи його bf16-версію.
+    for name in weights:
+        weights[name] = weights[name].float()
+    # У safetensors tied-параметри можуть зберігатись лише під одним ім'ям.
+    if "shared.weight" not in weights:
+        weights["shared.weight"] = weights["encoder.embed_tokens.weight"]
+    tokenizer = AutoTokenizer.from_pretrained(
+        SWITCH_MODEL_ID, revision=SWITCH_REVISION, cache_dir=CACHE_DIR)
+    return config, weights, tokenizer
+
+
+def restore_single_span(prompt, generated_text):
+    """Вставити перший згенерований span замість одного sentinel у prompt."""
+    if prompt.count("<extra_id_0>") != 1 or "<extra_id_0>" not in generated_text:
+        return None
+    span = generated_text.split("<extra_id_0>", 1)[1]
+    for marker in ("<extra_id_1>", "</s>", "<pad>"):
+        span = span.split(marker, 1)[0]
+    return prompt.replace("<extra_id_0>", span.strip())
+
+
+@torch.inference_mode()
+def compare_switch_pretrained(config, weights, tokenizer):
+    # Завантаження тих самих ваг без другої мережевої копії.
+    reference = SwitchTransformersForConditionalGeneration(config).eval()
+    complete = dict(weights)
+    if config.tie_word_embeddings:
+        for name in ("encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"):
+            complete[name] = weights["shared.weight"]
+    reference.load_state_dict(complete, strict=True)
+    results = []
+    for prompt in ("The capital of France is <extra_id_0>.",
+                   "The opposite of hot is <extra_id_0>."):
+        inputs = tokenizer(prompt, return_tensors="pt")
+        prefix = torch.tensor([[config.decoder_start_token_id, tokenizer.convert_tokens_to_ids("<extra_id_0>")]])
+        log = []
+        actual = switch_forward(inputs.input_ids, inputs.attention_mask, prefix, weights, config, log)
+        expected = reference(**inputs, decoder_input_ids=prefix, use_cache=False).logits
+        error = (actual - expected).abs().max().item()
+        torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-4)
+        ours = switch_generate(inputs.input_ids, inputs.attention_mask, weights, config)
+        theirs = reference.generate(**inputs, max_new_tokens=24, do_sample=False,
+                                    num_beams=1, use_cache=False)
+        assert torch.equal(ours, theirs), (ours, theirs)
+        raw = tokenizer.decode(ours[0], skip_special_tokens=False)
+        restored = restore_single_span(prompt, raw)
+        print("Вхід:", prompt)
+        print("Decoder:", raw)
+        print("Відновлений текст:", restored if restored is not None else "Не отримано sentinel-відповідь")
+        print(f"✓ max |Δlogits|={error:.2e}; greedy id збігаються")
+        for stack_name, layer, routes, accepted in log:
+            if stack_name == "encoder":
+                valid = inputs.attention_mask.bool() & accepted
+                counts = torch.bincount(routes[valid], minlength=config.num_experts)
+                print(f"  encoder block {layer}: {counts.tolist()} токенів на експерта")
+        results.append(dict(prompt=prompt, generated=raw, restored=restored, max_logit_error=error))
+    return results
+
+if __name__ == "__main__" and RUN_OPTIONAL_MOE:
+    switch_config, switch_weights, switch_tokenizer = load_switch_checkpoint()
+    switch_results = compare_switch_pretrained(switch_config, switch_weights, switch_tokenizer)
+
+# %% [markdown]
+# **Приклад перевіреного запуску** з наведеним snapshot у float32:
+#
+# | Вхід | Відновлений текст |
+# |---|---|
+# | `The capital of France is <extra_id_0>.` | `The capital of France is Paris.` |
+# | `The opposite of hot is <extra_id_0>.` | `The opposite of hot is cold.` |
+#
+# Для обох прикладів власний forward дав ті самі logits і greedy id,
+# що й Transformers 4.46.3. Це короткі демонстрації span filling;
+# вони не гарантують правильного відновлення довільних фактів чи речень.
+#
+# ### 12.5. Необов'язковий звіт
+#
+# 1. Відновіть пропуски у трьох власних англійських реченнях з одним sentinel.
+#    Запишіть input, decoder output зі спеціальними токенами та відновлений текст.
+# 2. Поясніть, чому це інша задача, ніж переклад у частині T5-small.
+# 3. Наведіть похибку logits і перевірку збігу greedy id з Transformers.
+# 4. Для справжніх токенів encoder побудуйте гістограму призначень експертам.
+#    Поясніть, чому різні sparse-блоки можуть мати різні маршрути.
+# 5. Що станеться, якщо нормувати top-1 gate до 1? Перевірте зміну logits.
+# 6. Чому sparse-модель має багато параметрів, хоча токен проходить через
+#    один експерт на sparse-блок? Чому Python dispatch не гарантує прискорення?
+#
 # %% [markdown]
 # ## 13. Дослідження та звіт
 #

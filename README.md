@@ -33,21 +33,34 @@ float32 ваг). Перший запуск завантажує ваги й то
 8. Порівняння pretrained logits і token id із Transformers; власні переклади.
 9. Швидкість генерації: власна реалізація, Transformers без cache та з KV-cache;
    прогрів, медіана часу й tokens/s для однакових виходів.
-10. Необов’язково: MoE замість FFN — Linear router, sparse top-k dispatch,
-    зважена сума експертів і підключення до останнього encoder-блока.
-    Експерти повторно використовують реалізований FFN; навчання не потрібне.
-    Щоб виконати додаткові комірки, заповніть `moe_ffn` та встановіть
+10. Необов’язково: справжній pretrained MoE `google/switch-base-8`.
+    Реалізуємо Linear router і sparse top-1 dispatch, повторно використовуємо
+    T5-компоненти, завантажуємо safetensors і відновлюємо пропуски в тексті.
+    Навчання не потрібне. Заповніть `switch_moe` та встановіть
     `RUN_OPTIONAL_MOE = True`. Основна частина не залежить від цієї вправи.
+    Завантаження: приблизно 1.24 GB bf16 ваг; CPU float32 копія — 2.48 GB,
+    для порівняння з еталоном потрібні дві копії та додаткова пам’ять.
 
 Для підтримки матеріалів:
 
 ```bash
-make figures          # відтворити SVG-схему MoE
+make figures          # перевірити локальний оригінал рисунка зі статті
 make notebook         # відтворити notebook із percent-cell Python
 make check            # локальні перевірки на еталонних підстановках
 make check-pretrained # додатково завантажити T5 і перевірити реальні переклади
+make check-switch-pretrained # завантажити Switch (1.24 GB) і перевірити span filling
 ```
 
 Перевірки не заповнюють студентський файл. `tools/reference_bodies.json`
 містить еталонні тіла вправ для викладацької перевірки. У власній реалізації
 не використовуємо готові T5-блоки: Transformers служить токенізатором та еталоном.
+
+T5-small не містить MoE. Додаткове завдання збирає іншу навчену модель —
+Switch-base-8 зі справжніми router-вагами та експертами. Вона відновлює
+пропущені фрагменти англійського тексту; це не chat-модель і не готовий перекладач.
+Оригінальний рисунок 2 зі статті Switch Transformers показує її top-1 routing.
+[Походження рисунка](figures/README.md).
+
+Перевірений приклад MoE: `The capital of France is <extra_id_0>.` →
+`The capital of France is Paris.`; `The opposite of hot is <extra_id_0>.` →
+`The opposite of hot is cold.` Власні logits та greedy id збіглися з Transformers.

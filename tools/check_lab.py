@@ -31,6 +31,7 @@ def solved_source():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pretrained', action='store_true', help='download checkpoint and compare real inference')
+    parser.add_argument("--switch-pretrained", action="store_true", help="download 1.24 GB trained Switch checkpoint and compare span filling")
     args = parser.parse_args()
     source = (ROOT / 'lab_transformer.py').read_text()
     compile(source, 'lab_transformer.py', 'exec')
@@ -38,7 +39,7 @@ def main():
     assert notebook['cells'] == split_cells(source), 'Regenerate notebook with make notebook'
     namespace = {'__name__': 'lab_checks'}
     exec(compile(solved_source(), 'lab_transformer_solved.py', 'exec'), namespace)
-    for name in ('test_primitives', 'test_masks', 'test_attention', 'test_tiny_model', 'test_moe'):
+    for name in ('test_primitives', 'test_masks', 'test_attention', 'test_tiny_model', 'test_switch_model'):
         namespace[name]()
     # Exercise generation stopping independently of random model outputs.
     import torch
@@ -59,6 +60,11 @@ def main():
         reference = namespace['compare_pretrained'](config, weights, tokenizer)
         rows = namespace['benchmark_inference'](config, weights, tokenizer, reference, repeats=3, warmup=1)
         assert len(rows) == 3 and all(row['median_seconds'] > 0 for row in rows)
+
+    if args.switch_pretrained:
+        config, weights, tokenizer = namespace['load_switch_checkpoint']()
+        results = namespace['compare_switch_pretrained'](config, weights, tokenizer)
+        assert len(results) == 2 and all(result['restored'] for result in results)
 
 
 if __name__ == '__main__':
