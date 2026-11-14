@@ -39,7 +39,7 @@ def main():
     assert notebook['cells'] == split_cells(source), 'Regenerate notebook with make notebook'
     namespace = {'__name__': 'lab_checks'}
     exec(compile(solved_source(), 'lab_transformer_solved.py', 'exec'), namespace)
-    for name in ('test_primitives', 'test_masks', 'test_attention', 'test_tiny_model', 'test_switch_model'):
+    for name in ('test_primitives', 'test_masks', 'test_attention', 'test_tiny_model', 'test_switch_router', 'test_switch_model'):
         namespace[name]()
     # Exercise generation stopping independently of random model outputs.
     import torch

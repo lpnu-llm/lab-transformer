@@ -461,36 +461,114 @@ if __name__ == "__main__":
 # Attention, RMSNorm, residual та проєкція у словник вже знайомі.
 # Новий навчуваний шар — `Linear(D, E)` без bias: router.
 #
-# ### 12.1. Router і dispatch — єдина нова вправа
+# ### 12.1. Router: спочатку конкретний приклад
 #
-# `z=(B,L,D)` → `scores=(B,L,E)` → softmax по E → argmax → expert FFN.
-# Повторно використайте `linear` та `ffn`. `experts` — список `(wi, wo)`.
-# Поверніть `(branch, routes, accepted)` форм `(B,L,D)`, `(B,L)`, `(B,L)`.
-# Викликайте лише експертів, які отримали токени, і лише для цих токенів.
+# Router — звичайний лінійний шар: кожен рядок `router_weight` відповідає
+# одному експерту. Він отримує поточний стан токена **після RMSNorm**.
+# Приклад із двома координатами та трьома експертами:
 #
-# Checkpoint також задає `expert_capacity=64`: у **кожній послідовності**
-# експерт приймає перші 64 призначені йому токени. Порахуйте порядкові номери
-# через one-hot маршрути та cumsum по L. `accepted` позначає токени в межах
-# capacity. Для точного збігу з Transformers 4.46.3 почніть із `next_states=z.clone()`,
-# замініть прийняті токени виходами їхніх експертів, а потім помножте **всі**
-# `next_states` на максимальну router-ймовірність. Отже, overflow тут повертає
-# `gate*z` усередині гілки; зовнішнє residual-додавання виконується окремо.
-# Це опис поведінки конкретної еталонної реалізації, а не загальне правило MoE.
-# Padding джерела маскуємо в attention, але router цієї версії рахує всі позиції.
-# У коротких прикладах overflow не виникає; tiny-тест нижче перевіряє його окремо.
+# ```text
+# z = [2, 0]                 W_router = [[ 1,  0],   ← експерт 0
+#                                        [ 0,  1],   ← експерт 1
+#                                        [-1, -1]]   ← експерт 2
+# scores = z @ W_router.T = [2, 0, -2]
+# probabilities = softmax(scores) ≈ [0.8668, 0.1173, 0.0159]
+# route = 0; gate ≈ 0.8668
+# MoE-гілка для цього токена = 0.8668 * FFN_0(z)
+# ```
+#
+# Для `z=[0,2]` scores дорівнюють `[0,2,-2]`: обирається експерт 1.
+# Отже, одна й та сама матриця router може спрямувати різні токени до різних
+# експертів. Обчислення всередині експертів уже реалізовані функцією `ffn`.
+# Gate — початкова softmax-ймовірність обраного експерта, **не** одиниця.
+# Номер експерта і gate мають різні ролі: перший обирає FFN, другий масштабує вихід.
 
 # %%
 from transformers import SwitchTransformersConfig, SwitchTransformersForConditionalGeneration
 
 SWITCH_MODEL_ID = "google/switch-base-8"
 # Фіксований safetensors-конвертований snapshot офіційного checkpoint (PR #5).
-# Завантажуємо лише config, tokenizer та safetensors; remote code не виконуємо.
 SWITCH_REVISION = "4f9b6f805db423183c0e7c3cda7611e43364acac"
 
+# Готовий числовий приклад — запускається до нової вправи.
+example_z = torch.tensor([[[2., 0.], [0., 2.]]])
+example_router_weight = torch.tensor([[1., 0.], [0., 1.], [-1., -1.]])
+example_scores = example_z @ example_router_weight.T
+example_probabilities = torch.softmax(example_scores, dim=-1)
+if __name__ == "__main__":
+    print("Router scores:", example_scores)
+    print("Router probabilities:", example_probabilities)
+    print("Обрані експерти:", example_probabilities.argmax(dim=-1))
 
-def switch_moe(z, router_weight, experts, capacity):
-    """Switch top-1: router → capacity mask → selected FFN → gate * output."""
+# %% [markdown]
+# **Єдина нова вправа: реалізуйте лише `switch_router`.**
+#
+# Вхід: `z=(B,L,D)` і `router_weight=(E,D)`.
+#
+# 1. Обчисліть scores через раніше реалізовану `linear`.
+# 2. Застосуйте softmax по останній осі — експертах. Scores та softmax
+#    обчислюйте у float32; probabilities поверніть у dtype вхідного `z`.
+# 3. Для кожного токена знайдіть максимальну ймовірність і номер експерта.
+#
+# Поверніть `(probabilities, routes, gates)` форм `(B,L,E)`, `(B,L)`, `(B,L,1)`.
+# Збережений вимір у gates потрібен, щоб множити на вихід FFN форми `(B,L,D)`.
+# Не викликайте тут експертів: router лише вирішує, куди передати токен.
+# Capacity mask, dispatch, експерти та повна мережа нижче вже надані.
+
+# %%
+def switch_router(z, router_weight):
+    """Linear → softmax → top-1: поверніть probabilities, routes, gates."""
     ...
+
+
+def test_switch_router():
+    z = torch.tensor([[[2., 0.], [0., 2.]], [[0., 2.], [2., 0.]]])
+    weight = torch.tensor([[1., 0.], [0., 1.], [-1., -1.]])
+    probabilities, routes, gates = switch_router(z, weight)
+    assert probabilities.shape == (2, 2, 3)
+    assert routes.shape == (2, 2) and gates.shape == (2, 2, 1)
+    assert routes.tolist() == [[0, 1], [1, 0]]
+    expected = torch.tensor([0.8668133, 0.1173104, 0.0158762])
+    torch.testing.assert_close(probabilities[0, 0], expected)
+    torch.testing.assert_close(probabilities[0, 1], expected[[1, 0, 2]])
+    torch.testing.assert_close(gates, torch.full((2, 2, 1), expected[0].item()))
+    torch.testing.assert_close(probabilities.sum(-1), torch.ones(2, 2))
+    # Softmax має бути стійким до великих scores та спільного зсуву всіх scores.
+    shifted, _, _ = switch_router(z, weight + 1000.)
+    torch.testing.assert_close(shifted, probabilities)
+    # Усі експерти рівноймовірні: gate залишається 1/E, а не нормується до 1.
+    _, _, uniform_gate = switch_router(z, torch.zeros_like(weight))
+    torch.testing.assert_close(uniform_gate, torch.full_like(gates, 1 / 3))
+    print("✓ router: probabilities, expert ids, gates and batch dimensions")
+
+RUN_OPTIONAL_MOE = False
+if __name__ == "__main__" and RUN_OPTIONAL_MOE:
+    test_switch_router()
+
+# %% [markdown]
+# **Готова частина: dispatch і capacity — тут нічого дописувати не потрібно.**
+# Checkpoint задає `expert_capacity=64`: у кожній послідовності експерт приймає
+# перші 64 призначені токени. One-hot + cumsum рахує порядок призначень.
+# Для точного відтворення Transformers 4.46.3 починаємо з копії z, замінюємо
+# прийняті токени виходами експертів, потім множимо всі позиції на gate.
+# Отже, overflow у цій реалізації дає `gate*z` усередині гілки.
+# Зовнішній residual додається окремо. Це поведінка конкретної версії еталона.
+# Router тут обробляє також padding; source padding маскується в attention.
+
+# %%
+def switch_moe(z, router_weight, experts, capacity):
+    """Готовий dispatch: використайте студентський router і вже знайомі FFN."""
+    _, routes, gates = switch_router(z, router_weight)
+    one_hot = torch.nn.functional.one_hot(routes, num_classes=len(experts))
+    priority = one_hot.cumsum(dim=1)
+    dispatch = one_hot.bool() & (priority <= capacity)
+    accepted = dispatch.any(dim=-1)
+    next_states = z.clone()
+    for expert_id, (wi, wo) in enumerate(experts):
+        mask = dispatch[..., expert_id]
+        if mask.any():
+            next_states[mask] = ffn(z[mask], wi, wo)
+    return gates * next_states, routes, accepted
 
 # %% [markdown]
 # ### 12.2. Збираємо повну мережу з уже реалізованих компонентів
@@ -617,14 +695,13 @@ def test_switch_model():
     assert torch.equal(ours, theirs)
     print("✓ Switch: dense/sparse blocks, router, capacity, logits and greedy ids")
 
-RUN_OPTIONAL_MOE = False
 if __name__ == "__main__" and RUN_OPTIONAL_MOE:
     test_switch_model()
 
 # %% [markdown]
 # ### 12.4. Завантажуємо навчені ваги та відновлюємо пропуски
 #
-# Увімкніть `RUN_OPTIONAL_MOE=True` після реалізації `switch_moe` і запустіть
+# Увімкніть `RUN_OPTIONAL_MOE=True` після реалізації `switch_router` і запустіть
 # комірки нижче. Download (~1.24 GB) та перетворення bf16 → float32 не входять
 # у час inference. Еталон будуємо з тієї ж конфігурації та завантажуємо ті ж
 # тензори. Власний forward не викликає готові Switch-блоки.
