@@ -501,7 +501,8 @@ if __name__ == "__main__":
     print("Обрані експерти:", example_probabilities.argmax(dim=-1))
 
 # %% [markdown]
-# **Єдина нова вправа: реалізуйте лише `switch_router`.**
+# **Вправа з router складається з двох коротких частин:** вибір експерта
+# (`switch_router`) і множення його виходу на gate (`apply_router_gate`).
 #
 # Вхід: `z=(B,L,D)` і `router_weight=(E,D)`.
 #
@@ -546,6 +547,53 @@ if __name__ == "__main__" and RUN_OPTIONAL_MOE:
     test_switch_router()
 
 # %% [markdown]
+# ### Множення виходу експерта на router gate
+#
+# Обрати експерта недостатньо. Його вихід ще потрібно помножити на
+# **ймовірність, яку router призначив саме цьому експерту**:
+#
+# $$e = \operatorname{argmax}_j p_j(z), \qquad
+# y = p_e(z) \cdot \operatorname{FFN}_e(z).$$
+#
+# Наприклад, router із попередньої комірки вибрав експерта 0 із gate ≈ 0.8668.
+# Нехай цей експерт повернув `[10, -4]`. Тоді MoE-гілка повертає
+# `[8.668, -3.4672]`, а не початковий вихід експерта. Якщо residual-вхід
+# `x=[2,0]`, стан після додавання гілки — `[10.668,-3.4672]`.
+# Це поелементне множення: один gate для токена масштабує **всі координати**
+# його expert output. Множимо вихід FFN, а не його ваги чи вхід.
+#
+# **Допишіть `apply_router_gate`:** `expert_output=(B,L,D)`, `gates=(B,L,1)`.
+# Поверніть зважений вихід `(B,L,D)` через broadcasting. Не додавайте тут
+# residual: його додає готовий Transformer-блок. Gate не замінюйте на 1.
+# У навчанні це множення також дає шлях градієнта до ймовірності router,
+# хоча сам дискретний argmax не диференційований. У цій роботі лише inference.
+
+# %%
+def apply_router_gate(expert_output, gates):
+    """Масштабуйте вихід обраного експерта ймовірністю з router."""
+    ...
+
+
+def test_apply_router_gate():
+    outputs = torch.tensor([[[10., -4.], [2., 8.]], [[-3., 6.], [4., -2.]]])
+    gates = torch.tensor([[[0.8668], [0.25]], [[0.5], [0.75]]])
+    expected = torch.tensor([[[8.668, -3.4672], [0.5, 2.]], [[-1.5, 3.], [3., -1.5]]])
+    original = outputs.clone()
+    torch.testing.assert_close(apply_router_gate(outputs, gates), expected)
+    torch.testing.assert_close(outputs, original)
+    torch.testing.assert_close(apply_router_gate(outputs, torch.ones_like(gates)), outputs)
+    torch.testing.assert_close(apply_router_gate(outputs, torch.zeros_like(gates)), torch.zeros_like(outputs))
+    # З'єднуємо обидві частини задачі з реальним gate числового прикладу.
+    _, _, selected_gates = switch_router(example_z, example_router_weight)
+    expert_outputs = torch.tensor([[[10., -4.], [2., 8.]]])
+    actual = apply_router_gate(expert_outputs, selected_gates)
+    torch.testing.assert_close(actual[0, 0], torch.tensor([8.668133, -3.467253]))
+    print("✓ router gate: probability × expert output before residual")
+
+if __name__ == "__main__" and RUN_OPTIONAL_MOE:
+    test_apply_router_gate()
+
+# %% [markdown]
 # **Готова частина: dispatch і capacity — тут нічого дописувати не потрібно.**
 # Checkpoint задає `expert_capacity=64`: у кожній послідовності експерт приймає
 # перші 64 призначені токени. One-hot + cumsum рахує порядок призначень.
@@ -568,7 +616,7 @@ def switch_moe(z, router_weight, experts, capacity):
         mask = dispatch[..., expert_id]
         if mask.any():
             next_states[mask] = ffn(z[mask], wi, wo)
-    return gates * next_states, routes, accepted
+    return apply_router_gate(next_states, gates), routes, accepted
 
 # %% [markdown]
 # ### 12.2. Збираємо повну мережу з уже реалізованих компонентів
@@ -701,7 +749,8 @@ if __name__ == "__main__" and RUN_OPTIONAL_MOE:
 # %% [markdown]
 # ### 12.4. Завантажуємо навчені ваги та відновлюємо пропуски
 #
-# Увімкніть `RUN_OPTIONAL_MOE=True` після реалізації `switch_router` і запустіть
+# Увімкніть `RUN_OPTIONAL_MOE=True` після реалізації `switch_router` та
+# `apply_router_gate` і запустіть
 # комірки нижче. Download (~1.24 GB) та перетворення bf16 → float32 не входять
 # у час inference. Еталон будуємо з тієї ж конфігурації та завантажуємо ті ж
 # тензори. Власний forward не викликає готові Switch-блоки.
